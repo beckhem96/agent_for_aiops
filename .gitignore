@@ -1,0 +1,20 @@
+# 보안 파일
+.env
+secret.py
+
+# 가상환경
+venv/
+.venv/
+env/
+
+# 실행할 때 생기는 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Mac 사용자용 찌꺼기
+.DS_Store
+
+# IDE 설정 파일
+.idea/
+.vscode/
