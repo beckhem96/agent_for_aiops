@@ -7,6 +7,7 @@ import threading
 import time
 import base64
 
+from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from fastapi import FastAPI, Request, BackgroundTasks
@@ -15,6 +16,7 @@ from slack_sdk import WebClient
 # ==========================================
 # Slack 토큰 세팅
 # ==========================================
+load_dotenv()
 # 앱 설정 페이지에서 발급받은 토큰들을 환경변수나 여기에 직접 넣으세요.
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
@@ -57,7 +59,7 @@ def clean_text2(text: str) -> str:
 # ==========================================
 # 2. ⚡ 규칙 기반 파싱 에이전트 (No LLM!)
 # ==========================================
-def parse_message_to_format(user_text: str, image_data=None, is_jira=False) -> dict:
+def parse_message_to_format(user_text: str, title_text: str, image_data=None, is_jira=False) -> dict:
     """
     LLM 없이 오직 키워드와 정규식 규칙(Rule)만으로 데이터를 추출합니다.
     (속도 0.001초 컷!)
@@ -83,14 +85,12 @@ def parse_message_to_format(user_text: str, image_data=None, is_jira=False) -> d
     # 콜론(:) 앞뒤의 띄어쓰기까지 유연하게 잡아냅니다.
     formatted_data = {}
     if msg_type == "voc" or msg_type == "jira":
-        title_match = re.search(r'제목[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|시나리오|기대결과|환경|증상)|$)', user_text, flags=re.DOTALL)
         scenario_match = re.search(r'시나리오[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|증상|빈도|기대결과)|$)', user_text, flags=re.DOTALL)
         error = re.search(r'증상[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|기대결과|시나리오|빈도)|$)', user_text, flags=re.DOTALL)
         expected_match = re.search(r'기대결과[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|에러|기대결과|시나리오|빈도|증상)|$)', user_text,
                                    flags=re.DOTALL)
-
         formatted_data = {
-            "title": clean_text(title_match.group(1)).strip() if title_match else "제목 없음 (파싱 불가)",
+            "title": clean_text(title_text).strip() if title_text else "제목 없음 (파싱 불가)",
             "type": msg_type,
             "env": env,
             "scenario": clean_text(scenario_match.group(1)).strip() if scenario_match else "파싱 불가",
@@ -98,7 +98,6 @@ def parse_message_to_format(user_text: str, image_data=None, is_jira=False) -> d
             "error": clean_text(error.group(1)).strip() if error else "파싱 불가",
             "expected_result": clean_text(expected_match.group(1)).strip() if expected_match else "파싱 불가"
         }
-
         # 🌟 핵심: Jira 타입일 때만 이미지 데이터를 추가합니다!
         if msg_type == "jira":
             # API 요구사항에 맞춰 빈 문자열("")이나 null(None)로 처리 가능
@@ -112,11 +111,13 @@ def parse_message_to_format(user_text: str, image_data=None, is_jira=False) -> d
             extracted_error = user_text.replace("APM 서버 에러 알림", "").strip()
 
         formatted_data = {
+            "title": "",
             "type": msg_type,
             "env": env,
-            "error": clean_text(extracted_error)
+            "scenario": "",
+            "error": clean_text(extracted_error),
+            "expected_result": ""
         }
-
     return formatted_data
 
 
@@ -198,7 +199,7 @@ def process_jira_webhook(payload: dict):
             )
 
         # 2️⃣ 아까 만든 파싱 함수에 텍스트(description)와 이미지(Base64)를 같이 던져줍니다!
-        formatted_data = parse_message_to_format(user_text=description, image_data=base64_images_list, is_jira=True)
+        formatted_data = parse_message_to_format(user_text=description, title_text=summary, image_data=base64_images_list, is_jira=True)
 
         # 3️⃣ 예쁘게 포맷팅된 데이터를 외부 API로 쏩니다! 🚀
         target_api_url = "https://httpbin.org/post"
@@ -207,10 +208,11 @@ def process_jira_webhook(payload: dict):
             json=formatted_data,
             headers={"Content-Type": "application/json"}
         )
-        slack_client.chat_postMessage(
-            channel=SLACK_CHANNEL_ID,
-            text=f"```{api_response.json()['data'][:1000] + "....."}```"
-        )
+
+        # slack_client.chat_postMessage(
+        #     channel=SLACK_CHANNEL_ID,
+        #     text=f"```{formatted_data + "....."}```"
+        # )
         print(f"API 전송 완료! HTTP 상태 코드: {api_response.status_code}")
 
     except Exception as e:
