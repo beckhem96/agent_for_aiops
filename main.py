@@ -20,6 +20,7 @@ from slack_sdk import WebClient
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from collections import defaultdict
+from aiokafka.admin import AIOKafkaAdminClient
 # ==========================================
 # Slack 토큰 세팅
 # ==========================================
@@ -38,8 +39,7 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
 ES_HOST = "http://localhost:9200"
 REDIS_HOST = "redis://localhost:6379"
-KAFKA_HOST = "localhost"
-KAFKA_PORT = 9092
+KAFKA_HOST = "localhost:9092"
 
 # ==========================================
 # 무한 루프 비동기 함수
@@ -251,17 +251,78 @@ async def check_redis_async():
 # ==========================================
 async def check_kafka_async():
     print("[Kafka] 상태 확인 중...")
+    # 카프카 관리자 (admin) 클라인트 생성
+    admin_client = AIOKafkaAdminClient(bootstrap_servers=KAFKA_HOST)
+
     try:
-        # 무거운 라이브러리 없이, 카프카 브로커 포트(9092)가 응답하는지 3초 안에 확인!
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(KAFKA_HOST, KAFKA_PORT), timeout=3.0
-        )
-        writer.close()
-        await writer.wait_closed()
-        print(f"[Kafka 정상] {KAFKA_PORT} 포트 응답 확인")
+        # 연결 시도 (여기서 뻗으면 브로커 자체가 죽은 것!)
+        await admin_client.start()
+
+        # 클러스터 메타데이터 털어오기 (토픽과 파티션 정보)
+        topics = await admin_client.list_topics()
+
+        if not topics:
+            print("[Kafka 정상] 생성된 토픽이 없습니다 (브로커 정상)")
+            await admin_client.close()
+            return
+
+        # 모든 토픽의 상세 상태를 가져온다.
+        topic_details = await admin_client.describe_topics(topics)
+
+        offline_partitions = []
+        under_replicated_partitions = []
+
+        # 심층 진단 로직: 아픈 파티션 색출하기
+        for topic in topic_details:
+            topic_name = topic['topic']
+            for partition in topic['partitions']:
+                part_id = partition['partition']
+                leader = partition['leader']
+                replicas = partition['replicas']
+                isr = partition['isr'] # In-Sync Replicas (정상적으로 복제 중인 노드emf)
+
+                # Case A: 리더가 없음 (Offline Partition) -> 당장 데이터 읽기/쓰기 불가능! (대형 장애)
+                if leader == -1 or leader is None:
+                    offline_partitions.append(f"`{topic_name}` (파티션: {part_id}")
+                # Case3 B: 복제분이 깨짐 (Under-replicated) -> 당장 멈추진 않지만 노드 하나 더 죽으면 데이터 날아감
+                elif len(isr) < len(replicas):
+                    under_replicated_partitions.append(f"`{topic_name}` (파티션: {part_id} | 정상복제: {len(isr)}/{len(replicas)})")
+        diagnostics = []
+
+        if offline_partitions:
+            diagnostics.append(
+                f"*오프라인 파티션 발생 (데이터 입출력 불가!)*\n"
+                f"   - *영향받은 토픽:* {', '.join(offline_partitions)}\n"
+                f"   - *진단:* 리더 브로커가 다운되어 해당 파티션의 읽기/쓰기가 멈췄습니다. 즉시 브로커를 재시작하거나 컨트롤러 상태를 확인하세요."
+            )
+        if under_replicated_partitions:
+            diagnostics.append(
+                f"*파티션 복제 지연/실패 (고가용성 위험)*\n"
+                f"   - *영향받은 토픽:* {', '.join(under_replicated_partitions)}\n"
+                f"   - *진단:* 설정된 복제본(Replica) 수만큼 데이터가 동기화되지 않고 있습니다. 특정 노드의 디스크나 네트워크 장애가 의심됩니다."
+            )
+        if diagnostics:
+            reports_str = "\n\n".join(diagnostics)
+            error_msg = (
+                f"*[Kafka 장애 리포트]*\n"
+                f"- *타겟 클러스터:* `{KAFKA_HOST}`\n\n"
+                f"- *[장애 원인 분석]*\n"
+                f"{reports_str}"
+            )
+            print(error_msg)
+            slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"{error_msg}")
+        else:
+            print(f"[Kafka 정상] 모든 토픽/파티션 복제 상태 안정적")
+        await admin_client.close()
     except Exception as e:
-        print(f"[Kafka 다운 의심] 브로커 응답 없음: {e}")
-        # slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[Kafka 다운 의심] 브로커 응답 없음: {e}")
+        error_msg = (
+            f"*[Kafka 브로커 다운 의심]* 💥\n"
+            f"- *접속 불가:* `{KAFKA_HOST}`\n"
+            f"- *에러 내용:* `{e}`\n"
+            f"> _Kafka 프로세스가 죽었거나 네트워크 방화벽이 막혔습니다!_"
+        )
+        print(error_msg)
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[Kafka 다운 의심] 브로커 응답 없음: {e}")
         # slack_client.chat_postMessage(...)
 
 # ==========================================
