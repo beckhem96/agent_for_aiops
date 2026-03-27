@@ -1,6 +1,10 @@
 import os
 import re
 import json
+import asyncio
+import httpx
+import redis.asyncio as redis
+
 import requests
 import uvicorn
 import threading
@@ -13,6 +17,9 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from fastapi import FastAPI, Request, BackgroundTasks
 from requests.auth import HTTPBasicAuth
 from slack_sdk import WebClient
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from collections import defaultdict
 # ==========================================
 # Slack 토큰 세팅
 # ==========================================
@@ -29,11 +36,269 @@ JIRA_SERVER = os.getenv("JIRA_SERVER")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 
+ES_HOST = "http://localhost:9200"
+REDIS_HOST = "redis://localhost:6379"
+KAFKA_HOST = "localhost"
+KAFKA_PORT = 9092
+
+# ==========================================
+# 무한 루프 비동기 함수
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 백그라운드 스케줄러가 아닌, 비동기(AsyncIO) 스케줄러 사용
+    scheduler = AsyncIOScheduler()
+
+    # 각각의 타겟을 독립적인 타이머로 등록 (서로 딜레이 안 줌)
+    scheduler.add_job(check_es_async, 'interval', seconds=30)  # ES는 30초마다
+    scheduler.add_job(check_redis_async, 'interval', seconds=30)  # Redis도 30초마다
+    scheduler.add_job(check_kafka_async, 'interval', seconds=30)  # Kafka도 30초마다
+
+    scheduler.start()
+    print("다중 타겟 비동기 헬스체크 스케줄러 가동 시작!")
+    yield  # 여기서 FastAPI 서버가 메인으로 돌아갑니다.
+
+    scheduler.shutdown()
+    print("스케줄러 안전하게 종료됨")
+
 # FastAPI 앱 & Slack 앱 초기화
-fastapi_app = FastAPI()
+fastapi_app = FastAPI(lifespan=lifespan)
 slack_app = App(token=SLACK_BOT_TOKEN)
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 jira_auth = HTTPBasicAuth(JIRA_EMAIL, JIRA_API_TOKEN)
+
+# ==========================================
+# Elasticsearch 비동기 헬스체크
+# ==========================================
+async def check_es_async():
+    print("[ES] 상태 확인 중...")
+    try:
+        # requests 대신 비동기 전용 httpx 사용! (FastAPI 멈춤 방지)
+        async with httpx.AsyncClient() as client:
+            health_res = await client.get(f"{ES_HOST}/_cluster/health", timeout=5.0)
+            health_data = health_res.json()
+            status = health_data.get("status")
+            unassigned_count = health_data.get("unassigned_shards", 0)
+
+            if status in ["yellow", "red"] and unassigned_count > 0:
+                shards_res = await client.get(
+                    f"{ES_HOST}/_cat/shards?format=json&h=index,shard,prirep,state,unassigned.reason",
+                    timeout=5.0
+                )
+                all_shards = shards_res.json()
+
+                # 'UNASSIGNED' 상태인 녀석들만 필터링
+                broken_shards = [s for s in all_shards if s.get("state") == "UNASSIGNED"]
+
+                # 에러 원인(Reason)별로 그룹핑하기 위한 딕셔너리 세팅
+                # 예: {"NODE_LEFT": set("user-db", "order-db"), "ALLOCATION_FAILED": set("log-db")}
+                reason_groups = defaultdict(set)
+                rep_shards = {}  # 각 Reason별 대표 샤드 정보 저장 (진단서 떼기 용도)
+
+                for s in broken_shards:
+                    reason = s.get("unassigned.reason", "UNKNOWN_REASON")
+                    idx_name = s.get("index")
+
+                    reason_groups[reason].add(idx_name)
+
+                    # 이 Reason의 대표 샤드를 아직 안 뽑았다면 하나 저장해둠
+                    if reason not in rep_shards:
+                        rep_shards[reason] = {
+                            "index": idx_name,
+                            "shard": int(s.get("shard", 0)),
+                            "primary": True if s.get("prirep") == "p" else False
+                        }
+                # 그룹별로 ES에게 심층 진단(explain) 요청하기
+                group_reports = []
+                for reason, indices in reason_groups.items():
+                    rep = rep_shards[reason]
+
+                    # 특정 인덱스의 특정 샤드를 콕 집어서 "얘 왜이래?" 하고 물어보는 POST 요청
+                    explain_body = {
+                        "index": rep["index"],
+                        "shard": rep["shard"],
+                        "primary": rep["primary"]
+                    }
+                    explain_res = await client.post(
+                        f"{ES_HOST}/_cluster/allocation/explain",
+                        json=explain_body,
+                        timeout=5.0
+                    )
+
+                    explanation = "진단 설명 없음"
+                    if explain_res.status_code == 200:
+                        explanation = explain_res.json().get("allocate_explanation", "진단 설명 없음")
+
+                    # 이 그룹의 리포트 블록 만들기
+                    indices_str = ", ".join(list(indices))
+                    group_report = (
+                        f"*에러 분류(Reason):* `{reason}`\n"
+                        f"   - *영향받은 인덱스:* `{indices_str}`\n"
+                        f"   - *ES 진단:* `{explanation}`"
+                    )
+                    group_reports.append(group_report)
+
+                # 슬랙용 최종 메시지 조립
+                reports_str = "\n\n".join(group_reports)
+                error_msg = (
+                    f"*[Elasticsearch 장애 리포트]*\n"
+                    f"- *클러스터 상태:* `{status.upper()}`\n"
+                    f"- *총 미할당 샤드:* `{unassigned_count}` 개\n\n"
+                    f"*[장애 원인별 그룹 분석]*\n"
+                    f"{reports_str}"
+                )
+                print(error_msg)
+                slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+
+            elif status in ["yellow", "red"]:
+                print(f"🚨 [ES 경고] 상태: {status} (샤드 외 문제)")
+            else:
+                print(f"✅ [ES 정상] status: green")
+    except Exception as e:
+        print(f"[ES 다운 의심] 연결 실패: {e}")
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[ES 다운 의심] 연결 실패: {e}")
+
+
+
+# ==========================================
+# Redis 비동기 헬스체크
+# ==========================================
+async def check_redis_async():
+    print("[Redis] 상태 확인 중...")
+    try:
+        # 비동기 Redis 클라이언트 연결
+        r = redis.from_url(REDIS_HOST)
+        # 1차 진단: INFO(현재 상태)와 CONFIG(설정값 한계치) 둘 다 가져오기
+        info = await r.info('all')
+        config = await r.config_get('*')
+
+        used_memory = info.get("used_memory_human")
+        max_memory = int(config.get("maxmemory", 0))
+        mem_fragmentation = info.get("mem_fragmentation_ratio", 0)
+        rejected_conn = info.get("rejected_connections", 0)
+        connected_clients = info.get("connected_clients", 0)
+        max_clients = int(config.get("maxclients", 10000))
+        evicted_keys = info.get("evicted_keys", 0) # 꽉 차서 강제로 지워진 데이터 수
+
+        anomaly_detected = False
+        diagnostics = []
+
+        # 심층 진단 로직 분기 (3대장 잡기)
+        # Case A: 메모리 폭발(OOM 직접 or 강제 삭제중)
+        if (max_memory > 0 and used_memory / max_memory > 0.9) or evicted_keys >0:
+            anomaly_detected = True
+            diagnostics.append(
+                f"*메모리 포화 (OOM 경고)*\n"
+                f"   - *상태:* 사용량 `{info.get('used_memory_human')}` / 한계치 `{max_memory} bytes`\n"
+                f"   - *강제 삭제(Evicted):* `{evicted_keys}` 건\n"
+                f"   - *진단:* 설정된 maxmemory에 도달하여 기존 캐시 데이터 유실이 발생 중입니다. 메모리 증설 또는 TTL(만료 시간) 점검이 시급합니다."
+            )
+        # Case B: 커넥션 풀 고갈 (앱에서 Redis로 접근 불가)
+        if connected_clients >= max_clients * 0.9 or rejected_conn > 0:
+            anomaly_detected = True
+            diagnostics.append(
+                f"*커넥션 고갈 (연결 거부)*\n"
+                f"   - *상태:* 현재 연결 `{connected_clients}` / 최대 허용 `{max_clients}`\n"
+                f"   - *거절된 연결 누적:* `{rejected_conn}` 건\n"
+                f"   - *진단:* Java/Spring 앱의 Connection Pool 설정이 너무 작거나, 커넥션 누수(Close 안 함)가 의심됩니다."
+            )
+        # Case C: 슬로우 쿼리 (어디서 싱글 스레드를 막고 있나?)
+        # 에러가 감지 되었다면, 범인을 잡기위해 최근 가장 느렸던 명령어 3개를 털어옴
+        if anomaly_detected:
+            slowlogs = await r.slowlog_get(3)
+            if slowlogs:
+                slow_cmds = []
+                for log in slowlogs:
+                    # byte를 string으로 변환해서 명령어 조합
+                    cmd = " ".join([m.decode('utf-8') if isinstance(m, bytes) else str(m) for m in log['command']])
+                    duration_ms = log['duration'] / 1000.0
+                    slow_cmds.append(f"`{cmd}` ({duration_ms}ms)")
+
+                diagnostics.append(
+                    f"*최근 병목 유발 명령어 (SlowLog)*\n   - " +
+                    "\n   - ".join(slow_cmds) +
+                    f"\n   - *진단:* Redis는 싱글 스레드입니다. 위 무거운 명령어(`KEYS *` 등)가 전체 시스템을 멈추게 했을 확률이 매우 높습니다."
+                )
+        # Case D: 메모리 파편화(효율성 최악 상태)
+        # 비율이 1.5 이상이면 물리적 메모리가 심각하게 낭비되고 있다는 뜻
+        if mem_fragmentation > 1.5:
+            anomaly_detected = True
+            diagnostics.append(
+                f"*메모리 파편화 심각 (조각모음 필요)*\n"
+                f"   - *파편화율(Ratio):* `{mem_fragmentation:.2f}` (정상 범위: 1.0 ~ 1.5)\n"
+                f"   - *진단:* 실제 데이터 크기보다 물리적 메모리를 너무 많이 점유하고 있습니다. Redis의 `activedefrag yes` 설정 활성화 또는 서비스 안정 시점에 재시작을 권장합니다.\n"
+            )
+        # 최종 메시지 조립
+        if anomaly_detected:
+            reports_str = "\n\n".join(diagnostics)
+            error_msg = (
+                f"*[Redis 장애 리포트]*\n"
+                f"- *타겟 서버:* `{REDIS_HOST}`\n\n"
+                f"*[장애 원인 분석]*\n"
+                f"{reports_str}"
+            )
+            print(error_msg)
+            slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+        else:
+            print(f"[Redis 정상] 메모리 및 커넥션 안정적")
+        await r.aclose()  # 연결 예쁘게 닫기
+    except Exception as e:
+        print(f"[Redis 다운 의심] 연결 실패: {e}")
+        # slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[Redis 다운 의심] 연결 실패: {e}")
+
+# ==========================================
+# Kafka 비동기 헬스체크 (초경량 TCP Socket 체크)
+# ==========================================
+async def check_kafka_async():
+    print("[Kafka] 상태 확인 중...")
+    try:
+        # 무거운 라이브러리 없이, 카프카 브로커 포트(9092)가 응답하는지 3초 안에 확인!
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(KAFKA_HOST, KAFKA_PORT), timeout=3.0
+        )
+        writer.close()
+        await writer.wait_closed()
+        print(f"[Kafka 정상] {KAFKA_PORT} 포트 응답 확인")
+    except Exception as e:
+        print(f"[Kafka 다운 의심] 브로커 응답 없음: {e}")
+        # slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[Kafka 다운 의심] 브로커 응답 없음: {e}")
+        # slack_client.chat_postMessage(...)
+
+# ==========================================
+# ES 상태 확인하는 함수
+# ==========================================
+# async def check_elasticsearch_periodic():
+#     while True:
+#         print("⏳ [1분 주기] Elasticsearch 헬스체크 중...")
+#         try:
+#             # ES의 클러스터 헬스 API를 찌릅니다. (5초 안에 답 없으면 에러 처리)
+#             # requests.get은 '동기(Blocking)' 함수라 웨이터를 멈추게 합니다.
+#             # 그래서 asyncio.to_thread()로 "주방보조(별도 스레드)한테 맡기고 웨이터는 바로 복귀해!" 라고 명령합니다.
+#             response = await asyncio.to_thread(requests.get, f"{ES_HOST}/_cluster/health", timeout=5)
+#
+#             if response.status_code == 200:
+#                 data = response.json()
+#                 status = data.get("status")
+#                 unassigned = data.get("unassigned_shards", 0)
+#
+#                 # 🚨 에러 조건: 상태가 green이 아니거나, 길 잃은 샤드가 있을 때!
+#                 if status in ["yellow", "red"] or unassigned > 0:
+#                     error_msg = f"🚨 *[ES 장애 감지]*\n- *상태:* {status}\n- *Unassigned Shards:* {unassigned}\n- *확인 요망!*"
+#                     print(error_msg)
+#
+#                     # 여기서 기존에 만들어두신 슬랙 봇으로 전송!
+#                     slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+#                 else:
+#                     print(f"✅ [ES 정상] 현재 상태: {status}")
+#             else:
+#                 print(f"❌ ES 응답 에러: HTTP {response.status_code}")
+#
+#         except Exception as e:
+#             # 아예 ES 서버가 죽어서 통신조차 안 될 때! (이게 진짜 크리티컬)
+#             fatal_msg = f"💥 *[ES 서버 다운 의심]*\n- 접속 불가: `{ES_HOST}`\n- 에러 내용: {e}"
+#             print(fatal_msg)
+#             slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=fatal_msg)
+#         await asyncio.sleep(60)
 
 def clean_text(text: str) -> str:
     if not text:
