@@ -59,7 +59,7 @@ def clean_text2(text: str) -> str:
 # ==========================================
 # 2. ⚡ 규칙 기반 파싱 에이전트 (No LLM!)
 # ==========================================
-def parse_message_to_format(user_text: str, title_text: str, image_data=None, is_jira=False) -> dict:
+def parse_message_to_format(issue_id: str, user_text: str, title_text: str, image_data=None, is_jira=False):
     """
     LLM 없이 오직 키워드와 정규식 규칙(Rule)만으로 데이터를 추출합니다.
     (속도 0.001초 컷!)
@@ -89,7 +89,10 @@ def parse_message_to_format(user_text: str, title_text: str, image_data=None, is
         error = re.search(r'증상[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|기대결과|시나리오|빈도)|$)', user_text, flags=re.DOTALL)
         expected_match = re.search(r'기대결과[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|에러|기대결과|시나리오|빈도|증상)|$)', user_text,
                                    flags=re.DOTALL)
+        print(issue_id)
         formatted_data = {
+            "id" : issue_id,
+            "host": JIRA_SERVER,
             "title": clean_text(title_text).strip() if title_text else "제목 없음 (파싱 불가)",
             "type": msg_type,
             "env": env,
@@ -111,6 +114,8 @@ def parse_message_to_format(user_text: str, title_text: str, image_data=None, is
             extracted_error = user_text.replace("APM 서버 에러 알림", "").strip()
 
         formatted_data = {
+            "id" : issue_id,
+            "host": hostname,
             "title": "",
             "type": msg_type,
             "env": env,
@@ -199,7 +204,7 @@ def process_jira_webhook(payload: dict):
             )
 
         # 2️⃣ 아까 만든 파싱 함수에 텍스트(description)와 이미지(Base64)를 같이 던져줍니다!
-        formatted_data = parse_message_to_format(user_text=description, title_text=summary, image_data=base64_images_list, is_jira=True)
+        formatted_data = parse_message_to_format(issue_id=issue_key, user_text=description, title_text=summary, image_data=base64_images_list, is_jira=True)
 
         # 3️⃣ 예쁘게 포맷팅된 데이터를 외부 API로 쏩니다! 🚀
         target_api_url = "https://httpbin.org/post"
@@ -228,7 +233,7 @@ def handle_mention(event, say):
 
     try:
         # 1️⃣ 정규식 파서 가동!
-        formatted_data = parse_message_to_format(user_text)
+        formatted_data = parse_message_to_format("", user_text, "")
 
         # 2️⃣ 외부 API로 Request 전송 (httpbin 테스트)
         target_api_url = "https://httpbin.org/post"
@@ -239,7 +244,6 @@ def handle_mention(event, say):
             api_result = response.json()
 
             dummy = json.dumps(api_result.get('json'), ensure_ascii=False, indent=2)
-            # say(final_message)
             say(f"```{dummy}```")
             print(dummy)
         else:
