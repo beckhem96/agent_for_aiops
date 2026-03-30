@@ -6,6 +6,7 @@ secret.py
 venv/
 .venv/
 env/
+myvenv/
 
 # 실행할 때 생기는 캐시 파일
 __pycache__/

@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from collections import defaultdict
 from aiokafka.admin import AIOKafkaAdminClient
+from cassandra.cluster import Cluster, NoHostAvailable
+from cassandra import ReadTimeout, WriteTimeout, Unavailable, OperationTimedOut
 # ==========================================
 # Slack 토큰 세팅
 # ==========================================
@@ -40,6 +42,7 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 ES_HOST = "http://localhost:9200"
 REDIS_HOST = "redis://localhost:6379"
 KAFKA_HOST = "localhost:9092"
+CASSANDRA_HOST = "localhost"
 
 # ==========================================
 # 무한 루프 비동기 함수
@@ -53,9 +56,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(check_es_async, 'interval', seconds=30)  # ES는 30초마다
     scheduler.add_job(check_redis_async, 'interval', seconds=30)  # Redis도 30초마다
     scheduler.add_job(check_kafka_async, 'interval', seconds=30)  # Kafka도 30초마다
+    scheduler.add_job(check_cassandra_ultimate_async, 'interval', seconds=30)
 
     scheduler.start()
-    print("다중 타겟 비동기 헬스체크 스케줄러 가동 시작!")
+    print("[ES, Redis, Kafka, Cassandra] 4대장 통합 모니터링 가동 시작")
     yield  # 여기서 FastAPI 서버가 메인으로 돌아갑니다.
 
     scheduler.shutdown()
@@ -151,9 +155,9 @@ async def check_es_async():
                 slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
 
             elif status in ["yellow", "red"]:
-                print(f"🚨 [ES 경고] 상태: {status} (샤드 외 문제)")
+                print(f"[ES 경고] 상태: {status} (샤드 외 문제)")
             else:
-                print(f"✅ [ES 정상] status: green")
+                print(f"[ES 정상] status: green")
     except Exception as e:
         print(f"[ES 다운 의심] 연결 실패: {e}")
         slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[ES 다운 의심] 연결 실패: {e}")
@@ -306,7 +310,7 @@ async def check_kafka_async():
             error_msg = (
                 f"*[Kafka 장애 리포트]*\n"
                 f"- *타겟 클러스터:* `{KAFKA_HOST}`\n\n"
-                f"- *[장애 원인 분석]*\n"
+                f"*[장애 원인 분석]*\n"
                 f"{reports_str}"
             )
             print(error_msg)
@@ -324,7 +328,85 @@ async def check_kafka_async():
         print(error_msg)
         slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=f"[Kafka 다운 의심] 브로커 응답 없음: {e}")
         # slack_client.chat_postMessage(...)
+# ==========================================
+# cassandra 비동기 헬스체크
+# ==========================================
+async def check_cassandra_ultimate_async():
+    print("[Cassandra] 클러스터 상태 및 노드 진단 중...")
 
+    # 드라이버가 동기 방식 - 별도 스레드에서 실행되도록 함수로 묶음
+    def _connect_and_query():
+        # 타임 아웃을 3초로 짧게 줘서, 죽었을 때 무한정 기다리지 않게 만듦
+        cluster = Cluster([CASSANDRA_HOST], connect_timeout=3.0)
+        try:
+            session = cluster.connect()
+            # Gossip 프로토콜 기반 노드 상태(Up/Down) 검사
+            # 드라이버가 클러스터 전체의 메타데이터를 알고 있습니다
+            down_nodes = [host.address for host in cluster.metadata.all_hosts() if not host.is_up]
+            # 가벼운 쿼리로 Timeout 및 가용성(Unavailable) 테스트
+            local_info = session.execute("SELECT release_version FROM system.local", timeout=2.0).one()
+            version = local_info.release_version if local_info else "Unknown"
+
+            cluster.shutdown()
+            return {"status": "ok", "version": version, "down_nodes": down_nodes}
+
+        except Exception as inner_e:
+            cluster.shutdown()
+            raise inner_e
+
+    try:
+        result = await asyncio.to_thread(_connect_and_query)
+        # 쿼리는 성공했지만, 죽어있는 찌꺼기 노드가 발견되었을 때 (부분 장애)
+        if result["down_nodes"]:
+            error_msg = (
+                f"*[Cassandra 클러스터 경고]*\n"
+                f"- *상태:* 쿼리는 동작 중이나, 클러스터 내에 DOWN(DN) 상태인 노드가 존재합니다!\n"
+                f"- *죽은 노드 IP:* `{', '.join(result['down_nodes'])}`\n"
+                f"> _진단: 복제본(Replica) 유실 위험이 있습니다. `nodetool status`를 확인하고 죽은 노드를 복구하거나 제거(remove node)하세요._"
+            )
+            print(error_msg)
+            slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+        else:
+            print(f"[Cassandra 정상] 버전: {result['version']} (모든 노드 UP 상태)")
+    except Unavailable as e:
+        error_msg = (
+            f"*[Cassandra 가용성 장애 (Unavailable)]*\n"
+            f"- *요구된 일관성 수준(Consistency)을 만족할 수 없습니다.*\n"
+            f"- *상세:* `{e}`\n"
+            f"> _진단: 데이터를 읽고 쓰기 위해 필요한 최소 노드 수(Quorum 등)가 부족합니다. 대규모 노드 다운이 발생했습니다!_"
+        )
+        print(error_msg)
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+    except ReadTimeout as e:
+        error_msg = (
+            f"*[Cassandra 읽기 지연 (Read Timeout)]*\n"
+            f"- *데이터를 제시간에 읽어오지 못했습니다.*\n"
+            f"- *상세:* `{e}`\n"
+            f"> _진단: 특정 노드의 디스크 I/O가 100%를 쳤거나, 툼스톤(Tombstone) 데이터가 너무 많아 쿼리가 느려졌습니다._"
+        )
+        print(error_msg)
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+    except WriteTimeout as e:
+        error_msg = (
+            f"*[Cassandra 쓰기 지연 (Write Timeout)]*\n"
+            f"- *데이터 쓰기가 밀리고 있습니다.*\n"
+            f"- *상세:* `{e}`\n"
+            f"> _진단: 노드의 JVM GC(가비지 컬렉션) Pause가 길게 발생했거나, Commit Log 디스크가 병목을 겪고 있습니다._"
+        )
+        print(error_msg)
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+    except NoHostAvailable as e:
+        error_msg = (
+            f"*[Cassandra 접속 불가 (NoHostAvailable)]*\n"
+            f"- *접속 타겟:* `{CASSANDRA_HOST}`\n"
+            f"- *상세:* `{e}`\n"
+            f"> _진단: 클러스터의 모든 Seed 노드가 죽었거나, 방화벽(9042 포트)이 차단되었습니다._"
+        )
+        print(error_msg)
+        slack_client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=error_msg)
+    except Exception as e:
+        # 알 수 없는 기타 에러 (인증 실패 등)
+        print(f"[Cassandra 기타 에러] {type(e).__name__}: {e}")
 # ==========================================
 # ES 상태 확인하는 함수
 # ==========================================
