@@ -43,14 +43,18 @@ async def lifespan(app: FastAPI):
     scheduler = AsyncIOScheduler()
 
     # 각각의 타겟을 독립적인 타이머로 등록 (서로 딜레이 안 줌)
-    scheduler.add_job(check_es_async, 'interval', seconds=30)  # ES는 30초마다
-    scheduler.add_job(check_redis_async, 'interval', seconds=30)  # Redis도 30초마다
-    scheduler.add_job(check_kafka_async, 'interval', seconds=30)  # Kafka도 30초마다
-    scheduler.add_job(check_cassandra_ultimate_async, 'interval', seconds=30)
-    scheduler.add_job(check_postgres_ultimate_async, 'interval', seconds=30)
+    # scheduler.add_job(check_es_async, 'interval', seconds=30)  # ES는 30초마다
+    # scheduler.add_job(check_redis_async, 'interval', seconds=30)  # Redis도 30초마다
+    # scheduler.add_job(check_kafka_async, 'interval', seconds=30)  # Kafka도 30초마다
+    # scheduler.add_job(check_cassandra_ultimate_async, 'interval', seconds=30)
+    # scheduler.add_job(check_postgres_ultimate_async, 'interval', seconds=30)
 
     scheduler.start()
     print("[ES, Redis, Kafka, Cassandra] 4대장 통합 모니터링 가동 시작")
+
+    thread = threading.Thread(target=start_slack_socket_mode, daemon=True)
+    thread.start()
+
     yield  # 여기서 FastAPI 서버가 메인으로 돌아갑니다.
 
     scheduler.shutdown()
@@ -137,10 +141,12 @@ def parse_message_to_format(issue_id: str, user_text: str, title_text: str, imag
     else:
         log_match = re.search(r'```(.*?)```', user_text, flags=re.DOTALL)
         if log_match:
-            extracted_error = log_match.group(1).strip()
+            extracted_text = log_match.group(1).strip()
+            extracted_error = json.loads(extracted_text)
         else:
             extracted_error = user_text.replace("APM 서버 에러 알림", "").strip()
-
+        error = extracted_error.get("error", "에러 내용 없음")
+        hostname = extracted_error.get("hostname", "Unknown")
         formatted_data = {
             "id" : issue_id,
             "host": hostname,
@@ -148,7 +154,7 @@ def parse_message_to_format(issue_id: str, user_text: str, title_text: str, imag
             "type": msg_type,
             "env": env,
             "scenario": "",
-            "error": clean_text(extracted_error),
+            "error": clean_text(error),
             "expected_result": ""
         }
     return formatted_data
@@ -273,7 +279,7 @@ def handle_mention(event, say):
 
             dummy = json.dumps(api_result.get('json'), ensure_ascii=False, indent=2)
             say(f"```{dummy}```")
-            print(dummy)
+            # print(dummy)
         else:
             say(f"❌ **API 전송 실패!** (HTTP {response.status_code})")
 
@@ -291,12 +297,6 @@ def start_slack_socket_mode():
     print("⚡️ 슬랙 소켓 모드 일꾼 가동!")
     handler = SocketModeHandler(slack_app, SLACK_APP_TOKEN)
     handler.start()
-
-@fastapi_app.on_event("startup")
-def startup_event():
-    """FastAPI 서버가 켜질 때, 슬랙 봇도 별도의 스레드로 같이 켭니다."""
-    thread = threading.Thread(target=start_slack_socket_mode, daemon=True)
-    thread.start()
 
 if __name__ == "__main__":
     print("⚡️ 초고속 파싱 에이전트 봇 가동 완료! (No LLM)")
