@@ -40,7 +40,7 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 백그라운드 스케줄러가 아닌, 비동기(AsyncIO) 스케줄러 사용
-    scheduler = AsyncIOScheduler()
+    # scheduler = AsyncIOScheduler()
 
     # 각각의 타겟을 독립적인 타이머로 등록 (서로 딜레이 안 줌)
     # scheduler.add_job(check_es_async, 'interval', seconds=30)  # ES는 30초마다
@@ -49,15 +49,15 @@ async def lifespan(app: FastAPI):
     # scheduler.add_job(check_cassandra_ultimate_async, 'interval', seconds=30)
     # scheduler.add_job(check_postgres_ultimate_async, 'interval', seconds=30)
 
-    scheduler.start()
-    print("[ES, Redis, Kafka, Cassandra] 4대장 통합 모니터링 가동 시작")
+    # scheduler.start()
+    # print("[ES, Redis, Kafka, Cassandra] 4대장 통합 모니터링 가동 시작")
 
     thread = threading.Thread(target=start_slack_socket_mode, daemon=True)
     thread.start()
 
     yield  # 여기서 FastAPI 서버가 메인으로 돌아갑니다.
 
-    scheduler.shutdown()
+    # scheduler.shutdown()
     print("스케줄러 안전하게 종료됨")
 
 # FastAPI 앱 & Slack 앱 초기화
@@ -92,12 +92,7 @@ def clean_text2(text: str) -> str:
 # 2. ⚡ 규칙 기반 파싱 에이전트 (No LLM!)
 # ==========================================
 def parse_message_to_format(issue_id: str, user_text: str, title_text: str, image_data=None, is_jira=False):
-    """
-    LLM 없이 오직 키워드와 정규식 규칙(Rule)만으로 데이터를 추출합니다.
-    (속도 0.001초 컷!)
-    """
     text_lower = user_text.lower()
-    print(user_text)
     # 1. 유형(Type) 분류: 단순 키워드 매칭
     if any(keyword in text_lower for keyword in ["apm", "장애", "cpu", "메모리", "알람"]):
         msg_type = "apm"
@@ -116,12 +111,11 @@ def parse_message_to_format(issue_id: str, user_text: str, title_text: str, imag
     # 슬랙에 "제목: ~~~", "시나리오: ~~~" 형태로 들어온다고 가정한 파싱 로직입니다.
     # 콜론(:) 앞뒤의 띄어쓰기까지 유연하게 잡아냅니다.
     formatted_data = {}
-    if msg_type == "voc" or msg_type == "jira":
+    if msg_type == "voc" or msg_type == "jira": # voc는 아직 정리 안됨
         scenario_match = re.search(r'시나리오[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|증상|빈도|기대결과)|$)', user_text, flags=re.DOTALL)
         error = re.search(r'증상[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|기대결과|시나리오|빈도)|$)', user_text, flags=re.DOTALL)
         expected_match = re.search(r'기대결과[\s:\-\]]*(.*?)(?=\n\s*\[?(?:제목|에러|기대결과|시나리오|빈도|증상)|$)', user_text,
                                    flags=re.DOTALL)
-        print(issue_id)
         formatted_data = {
             "id" : issue_id,
             "host": JIRA_SERVER,
@@ -219,7 +213,7 @@ def process_jira_webhook(payload: dict):
             img_response = requests.get(download_url, auth=jira_auth)
 
             if img_response.status_code == 200:
-                print("✅ 이미지 다운로드 성공!")
+                print("이미지 다운로드 성공!")
                 file_uploads_list.append({
                     "file": img_response.content,  # 다운받은 바이트 데이터
                     "filename": file_name  # 파일 이름
@@ -230,18 +224,19 @@ def process_jira_webhook(payload: dict):
             else:
                 print(f"❌ 첨부파일 다운로드 실패 (HTTP {img_response.status_code})")
         if file_uploads_list:
-            print(f"🚀 총 {len(file_uploads_list)}개의 파일을 슬랙으로 한 번에 전송합니다...")
+            print(f"총 {len(file_uploads_list)}개의 파일을 슬랙으로 한 번에 전송합니다...")
             slack_client.files_upload_v2(
                 channel=SLACK_CHANNEL_ID,
                 initial_comment=f"새로운 이슈 등록: <{JIRA_SERVER}/browse/{issue_key}|{issue_key}>\n*제목:* {summary}\n*본문:*\n{clean_text2(description)}",
-                file_uploads=file_uploads_list  # 🌟 핵심: file= 대신 file_uploads= 에 리스트를 통째로 넘김!
+                file_uploads=file_uploads_list  # 핵심: file= 대신 file_uploads= 에 리스트를 통째로 넘김!
             )
 
         # 2️⃣ 아까 만든 파싱 함수에 텍스트(description)와 이미지(Base64)를 같이 던져줍니다!
         formatted_data = parse_message_to_format(issue_id=issue_key, user_text=description, title_text=summary, image_data=base64_images_list, is_jira=True)
 
-        # 3️⃣ 예쁘게 포맷팅된 데이터를 외부 API로 쏩니다! 🚀
-        target_api_url = "https://httpbin.org/post"
+        # 3️⃣ 예쁘게 포맷팅된 데이터를 외부 API로 쏩니다!
+        # target_api_url = "https://httpbin.org/post"
+        target_api_url = "http://localhost:8001/api/dummy/action"
         api_response = requests.post(
             target_api_url,
             json=formatted_data,
@@ -252,6 +247,20 @@ def process_jira_webhook(payload: dict):
         #     channel=SLACK_CHANNEL_ID,
         #     text=f"```{formatted_data + "....."}```"
         # )
+
+        if api_response.status_code == 200:
+            api_result = api_response.json()
+            print(api_result)
+            dummy = (
+                f"*에러 발생처*: {api_result["type"]}\n"
+                f"*분석 성공 여부*: {api_result["status"]}\n"
+                f"*PR*: {api_result["pr_status"]}\n"
+                f"*분석 결과*: \n{api_result["analysis_report"]}\n"
+            )
+            slack_client.chat_postMessage(
+                channel=SLACK_CHANNEL_ID,
+                text=dummy
+            )
         print(f"API 전송 완료! HTTP 상태 코드: {api_response.status_code}")
 
     except Exception as e:
@@ -260,7 +269,6 @@ def process_jira_webhook(payload: dict):
 # ==========================================
 # 3. 메인 로직 (슬랙 메시지 수신부)
 # ==========================================
-# @app.event("app_mention")
 @slack_app.event("message")
 def handle_mention(event, say):
     user_text = event['text']
@@ -270,16 +278,20 @@ def handle_mention(event, say):
         formatted_data = parse_message_to_format("", user_text, "")
 
         # 2️⃣ 외부 API로 Request 전송 (httpbin 테스트)
-        target_api_url = "https://httpbin.org/post"
+        # target_api_url = "https://httpbin.org/post"
+        target_api_url = "http://localhost:8001/api/dummy/action"
         response = requests.post(target_api_url, json=formatted_data, headers={"Content-Type": "application/json"})
-
         # 3️⃣ API 응답 결과 슬랙에 즉시 보고
         if response.status_code == 200:
             api_result = response.json()
 
-            dummy = json.dumps(api_result.get('json'), ensure_ascii=False, indent=2)
-            say(f"```{dummy}```")
-            # print(dummy)
+            dummy = (
+                f"*에러 발생처*: {api_result["type"]}\n"
+                f"*분석 성공 여부*: {api_result["status"]}\n"
+                f"*PR*: {api_result["pr_status"]}\n"
+                f"*분석 결과*: \n{api_result["analysis_report"]}\n"
+            )
+            say(dummy)
         else:
             say(f"❌ **API 전송 실패!** (HTTP {response.status_code})")
 
